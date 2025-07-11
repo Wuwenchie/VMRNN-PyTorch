@@ -44,6 +44,25 @@ def get_fusion_args():
     parser.add_argument('--num_decoder_layers', type=int, default=6,
                         help='Number of decoder layers')
     
+    # VMRNN 特定參數
+    parser.add_argument('--vmrnn_hidden_size', type=int, default=128,
+                        help='VMRNN hidden state size')
+    parser.add_argument('--vmrnn_num_layers', type=int, default=2,
+                        help='Number of VMRNN layers')
+    parser.add_argument('--vmrnn_dropout', type=float, default=0.1,
+                        help='VMRNN dropout rate')
+    
+    # 融合模型參數
+    parser.add_argument('--fusion_type', type=str, default='concat',
+                        choices=['concat', 'add', 'attention'],
+                        help='Fusion method for combining Geoformer and VMRNN')
+    parser.add_argument('--fusion_hidden_size', type=int, default=256,
+                        help='Hidden size for fusion layer')
+    parser.add_argument('--geoformer_weight', type=float, default=0.5,
+                        help='Weight for Geoformer in fusion (0-1)')
+    parser.add_argument('--vmrnn_weight', type=float, default=0.5,
+                        help='Weight for VMRNN in fusion (0-1)')
+    
     # 訓練參數
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
@@ -58,6 +77,17 @@ def get_fusion_args():
     parser.add_argument('--sv_ratio', type=float, default=0.1,
                         help='Supervision ratio for scheduled sampling')
     
+    # 學習率調度
+    parser.add_argument('--lr_scheduler', type=str, default='cosine',
+                        choices=['step', 'cosine', 'plateau'],
+                        help='Learning rate scheduler type')
+    parser.add_argument('--lr_step_size', type=int, default=30,
+                        help='Step size for StepLR scheduler')
+    parser.add_argument('--lr_gamma', type=float, default=0.1,
+                        help='Gamma for StepLR scheduler')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='Number of warmup epochs')
+    
     # 驗證和保存
     parser.add_argument('--epoch_valid', type=int, default=5,
                         help='Validation frequency (epochs)')
@@ -65,6 +95,8 @@ def get_fusion_args():
                         help='Model saving frequency (epochs)')
     parser.add_argument('--valid_samples', type=int, default=1000,
                         help='Number of validation samples')
+    parser.add_argument('--early_stopping', type=int, default=20,
+                        help='Early stopping patience (epochs)')
     
     # 梯度裁剪
     parser.add_argument('--clip_grad', action='store_true',
@@ -79,6 +111,8 @@ def get_fusion_args():
                         help='Results directory')
     parser.add_argument('--log_interval', type=int, default=100,
                         help='Logging frequency (batches)')
+    parser.add_argument('--tensorboard_log', type=str, default='./logs',
+                        help='Tensorboard log directory')
     
     # 數據路徑（需要根據您的實際路徑修改）
     parser.add_argument('--adr_pretr', type=str, 
@@ -103,4 +137,80 @@ def get_fusion_args():
                         help='Look back window for dataset1')
     parser.add_argument('--pre_len', type=int, default=6,
                         help='Prediction length for dataset1')
-    parser.add_argument('--interval', type=
+    parser.add_argument('--interval', type=int, default=1,
+                        help='Sampling interval for dataset')
+    
+    # 數據預處理參數
+    parser.add_argument('--normalize', action='store_true',
+                        help='Whether to normalize input data')
+    parser.add_argument('--data_augmentation', action='store_true',
+                        help='Whether to apply data augmentation')
+    parser.add_argument('--noise_level', type=float, default=0.01,
+                        help='Noise level for data augmentation')
+    
+    # 損失函數參數
+    parser.add_argument('--loss_type', type=str, default='mse',
+                        choices=['mse', 'mae', 'huber', 'combined'],
+                        help='Loss function type')
+    parser.add_argument('--loss_weights', type=float, nargs='+', default=[1.0],
+                        help='Weights for different loss components')
+    
+    # 評估指標
+    parser.add_argument('--eval_metrics', type=str, nargs='+',
+                        default=['mse', 'mae', 'rmse', 'mape'],
+                        help='Evaluation metrics to compute')
+    
+    # 實驗設置
+    parser.add_argument('--experiment_name', type=str, default='fusion_experiment',
+                        help='Experiment name for logging')
+    parser.add_argument('--run_name', type=str, default=None,
+                        help='Run name for this specific experiment')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug mode')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable verbose logging')
+    
+    # 多GPU訓練
+    parser.add_argument('--distributed', action='store_true',
+                        help='Use distributed training')
+    parser.add_argument('--local_rank', type=int, default=0,
+                        help='Local rank for distributed training')
+    
+    # 混合精度訓練
+    parser.add_argument('--mixed_precision', action='store_true',
+                        help='Use mixed precision training')
+    parser.add_argument('--grad_scale', type=float, default=1.0,
+                        help='Gradient scaling factor for mixed precision')
+    
+    return parser
+
+def validate_args(args):
+    """驗證參數的有效性"""
+    # 確保權重加起來等於1
+    if abs(args.geoformer_weight + args.vmrnn_weight - 1.0) > 1e-6:
+        print("Warning: Geoformer and VMRNN weights should sum to 1.0")
+        # 自動調整
+        total_weight = args.geoformer_weight + args.vmrnn_weight
+        args.geoformer_weight /= total_weight
+        args.vmrnn_weight /= total_weight
+    
+    # 確保批次大小是合理的
+    if args.train_batch_size <= 0 or args.valid_batch_size <= 0:
+        raise ValueError("Batch sizes must be positive")
+    
+    # 確保路徑存在或創建
+    import os
+    os.makedirs(args.res_dir, exist_ok=True)
+    os.makedirs(args.tensorboard_log, exist_ok=True)
+    
+    return args
+
+if __name__ == '__main__':
+    parser = get_fusion_args()
+    args = parser.parse_args()
+    args = validate_args(args)
+    
+    print("Fusion Model Configuration:")
+    print("-" * 50)
+    for key, value in vars(args).items():
+        print(f"{key}: {value}")
