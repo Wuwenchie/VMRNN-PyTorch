@@ -278,7 +278,7 @@ class PredictionHead(nn.Module):
 
 
 class GeoVMRNN(nn.Module):
-    """使用高階VMRNN Cell的地理時空預測模型"""
+    """使用高階 VMRNN Cell 的地理時空預測模型"""
     def __init__(self, mypara):
         super().__init__()
         self.mypara = mypara
@@ -302,7 +302,7 @@ class GeoVMRNN(nn.Module):
         self.patch_size = 4
         self.embed_dim = 256
         
-        # 使用左邊的高階VMRNN Cell
+        # 使用高階 VMRNN Cell (VMRNN-D)
         # 假設輸入圖像尺寸為224x224，計算patch分辨率
         self.img_size = 224  # 根據實際情況調整
         self.patch_embed = PatchEmbed(
@@ -316,7 +316,7 @@ class GeoVMRNN(nn.Module):
         patches_resolution = self.patch_embed.grid_size
         self.patches_resolution = patches_resolution
         
-        # 創建高階VMRNN Cell
+        # 創建高階 VMRNN Cell
         self.vmrnn_cell = VMRNNCell(
             hidden_dim=self.embed_dim,
             input_resolution=patches_resolution,
