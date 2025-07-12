@@ -42,7 +42,9 @@ mypara.lat_nino_relative = (15, 36)
 mypara.patch_size = (3, 4)
 mypara.H0 = int((mypara.lat_range[1] - mypara.lat_range[0]) / mypara.patch_size[0])
 mypara.W0 = int((mypara.lon_range[1] - mypara.lon_range[0]) / mypara.patch_size[1])
+# img size
 mypara.emb_spatial_size = mypara.H0 * mypara.W0
+
 
 # model
 mypara.model_savepath = "./model/"
