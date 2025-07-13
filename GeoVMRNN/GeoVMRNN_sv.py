@@ -176,11 +176,12 @@ class GeoVMRNN_Supervised(nn.Module):
                 self.img_height = int(lat_span / mypara.resolution)
                 self.img_width = int(lon_span / mypara.resolution)
             else:
-                # 否則直接使用度數作为像素數（可能需要調整）
+                # 否則直接使用度數作為像素數（可能需要調整）
                 self.img_height = int(lat_span)
                 self.img_width = int(lon_span)
+                
         elif hasattr(mypara, 'H0') and hasattr(mypara, 'W0'):
-            # 如果直接给出了patch后的尺寸
+            # 如果直接給出了patch后的尺寸
             self.H0 = mypara.H0
             self.W0 = mypara.W0
             self.img_height = self.H0 * self.patch_size[0]
@@ -400,11 +401,7 @@ class GeoVMRNN_Supervised(nn.Module):
                 )
                 
                 # 重新創建解碼輸入（使用混合數據）
-                connect_inout = self.create_decoder_input
-                (
-                    predictor, 
-                    torch.cat([mixed_predictand, predictand[:, -1:]], dim=1)
-                )
+                connect_inout = self.create_decoder_input(predictor, torch.cat([mixed_predictand, predictand[:, -1:]], dim=1))
                 
                 decoder_hidden = encoder_hidden
                 outputs = []
