@@ -14,7 +14,7 @@ class VSB(VSSBlock):
     def __init__(
         self,
         hidden_dim: int = 0,
-        input_resolution: tuple = None,  # 改为 None，强制传入
+        input_resolution: tuple = None,  # 改为 None，強制傳入
         drop_path: float = 0,
         norm_layer: Callable[..., nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         attn_drop_rate: float = 0,
