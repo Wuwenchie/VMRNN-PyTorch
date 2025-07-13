@@ -1,4 +1,4 @@
-from GeoVMRNN import GeoVMRNN
+from GeoVMRNN_sv import GeoVMRNN_Supervised
 from myconfig import mypara
 import torch
 from torch.utils.data import DataLoader
