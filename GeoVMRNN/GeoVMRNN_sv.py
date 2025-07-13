@@ -305,6 +305,17 @@ class GeoVMRNN_Supervised(nn.Module):
         
         return next_step, new_decoder_hidden
     
+    def create_decoder_input(self, predictor, predictand):
+    """創建解碼器輸入序列"""
+    # 確保維度匹配
+    last_input = predictor[:, -1:]  # [B, 1, C, H, W]
+    if predictand is not None:
+        teacher_input = predictand[:, :-1]  # [B, T-1, C, H, W]
+        decoder_input = torch.cat([last_input, teacher_input], dim=1)
+    else:
+        decoder_input = last_input
+    return decoder_input
+
     def forward(self, predictor, predictand=None, train=True, sv_ratio=0):
         """
         Args:
@@ -325,8 +336,8 @@ class GeoVMRNN_Supervised(nn.Module):
             # 訓練模式：使用teacher forcing
             assert predictand is not None
             
-            # 創建解碼輸入序列（與Geoformer相同的方式）
-            connect_inout = torch.cat([predictor[:, -1:], predictand[:, :-1]], dim=1)
+            # 使用新的函數創建解碼輸入序列
+            connect_inout = self.create_decoder_input(predictor, predictand)
             
             # 監督式訓練
             decoder_hidden = encoder_hidden
@@ -354,8 +365,13 @@ class GeoVMRNN_Supervised(nn.Module):
                     (1 - supervise_mask) * outvar_pred[:, :-1]
                 )
                 
-                # 重新預測
-                connect_inout = torch.cat([predictor[:, -1:], mixed_predictand], dim=1)
+                # 重新創建解碼輸入（使用混合數據）
+                connect_inout = self.create_decoder_input
+                (
+                    predictor, 
+                    torch.cat([mixed_predictand, predictand[:, -1:]], dim=1)
+                )
+                
                 decoder_hidden = encoder_hidden
                 outputs = []
                 
@@ -367,7 +383,7 @@ class GeoVMRNN_Supervised(nn.Module):
                     outputs.append(next_step)
                 
                 outvar_pred = torch.stack(outputs, dim=1)
-            
+        
         else:
             # 推理模式：自回歸生成
             decoder_hidden = encoder_hidden
@@ -391,6 +407,15 @@ class GeoVMRNN_Supervised(nn.Module):
         """推理模式"""
         return self.forward(predictor, train=False)
 
+# 添加維度檢查
+def check_dimensions(self, x, stage):
+    print(f"{stage}: {x.shape}")
+    return x
+
+# 在关键位置添加检查
+x = self.check_dimensions(x, "input")
+x = self.geo_cnn(x)
+x = self.check_dimensions(x, "after_geo_cnn")
 
 # 工廠函數
 def create_supervised_geo_vmrnn(mypara):
