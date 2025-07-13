@@ -167,16 +167,16 @@ class GeoVMRNN_Supervised(nn.Module):
             
         # 計算地理尺寸
         if hasattr(mypara, 'lat_range') and hasattr(mypara, 'lon_range'):
-            # 根据地理范围计算实际尺寸
+            # 根據地理範圍計算实际尺寸
             lat_span = mypara.lat_range[1] - mypara.lat_range[0]
             lon_span = mypara.lon_range[1] - mypara.lon_range[0]
             
-            # 如果有分辨率信息，使用分辨率计算
+            # 如果有分辨率信息，使用分辨率計算
             if hasattr(mypara, 'resolution'):
                 self.img_height = int(lat_span / mypara.resolution)
                 self.img_width = int(lon_span / mypara.resolution)
             else:
-                # 否则直接使用度数作为像素数（可能需要调整）
+                # 否則直接使用度數作为像素數（可能需要調整）
                 self.img_height = int(lat_span)
                 self.img_width = int(lon_span)
         elif hasattr(mypara, 'H0') and hasattr(mypara, 'W0'):
@@ -186,16 +186,16 @@ class GeoVMRNN_Supervised(nn.Module):
             self.img_height = self.H0 * self.patch_size[0]
             self.img_width = self.W0 * self.patch_size[1]
         else:
-            # 默认值
+            # 默認值
             self.img_height = 224
             self.img_width = 224
             
-        # 計算patch后的尺寸
+        # 計算patch後的尺寸
         self.H0 = self.img_height // self.patch_size[0]
         self.W0 = self.img_width // self.patch_size[1]
         self.emb_spatial_size = self.H0 * self.W0
         
-        # 地理输入分辨率（patch后的尺寸）
+        # 地理輸入分辨率（patch後的尺寸）
         self.geo_input_resolution = (self.H0, self.W0)
             
         # 計算cube_dim（與Geoformer保持一致）
@@ -446,7 +446,7 @@ def check_dimensions(self, x, stage):
     print(f"{stage}: {x.shape}")
     return x
 
-# 在关键位置添加检查
+# 在關鍵位置添加檢查
 x = self.check_dimensions(x, "input")
 x = self.geo_cnn(x)
 x = self.check_dimensions(x, "after_geo_cnn")
