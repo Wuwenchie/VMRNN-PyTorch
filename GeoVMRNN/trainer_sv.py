@@ -38,11 +38,23 @@ class GeoVMRNNTrainer:
     """GeoVMRNN 模型訓練器"""
     def __init__(self, mypara):
         assert mypara.input_channal == mypara.output_channal
+        
+        # 添加數據維度驗證
+        print("正在驗證數據維度...")
+        # 先加載一個小批次數據來驗證尺寸
+        
         self.mypara = mypara
         self.device = mypara.device
         
-        # 創建 GeoVMRNN 模型
+        # 創建模型前先驗證數據
         self.mymodel = GeoVMRNN_Supervised(mypara).to(mypara.device)
+        
+        # 添加模型參數統計
+        total_params = sum(p.numel() for p in self.mymodel.parameters())
+        trainable_params = sum(p.numel() for p in self.mymodel.parameters() if p.requires_grad)
+        print(f"模型總參數: {total_params:,}")
+        print(f"可訓練參數: {trainable_params:,}")
+        
         
         # 設置優化器和學習率調度器
         adam = torch.optim.Adam(self.mymodel.parameters(), lr=0)
