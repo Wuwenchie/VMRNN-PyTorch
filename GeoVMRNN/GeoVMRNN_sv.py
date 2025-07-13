@@ -21,7 +21,7 @@ class VSB(VSSBlock):
         d_state: int = 16,
         **kwargs
     ):
-        # 如果没有传入 input_resolution，使用默认值
+        # 如果沒有傳入 input_resolution，使用默认值
         if input_resolution is None:
             input_resolution = (224, 224)
             
