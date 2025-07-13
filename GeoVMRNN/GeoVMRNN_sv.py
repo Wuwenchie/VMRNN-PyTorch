@@ -14,13 +14,17 @@ class VSB(VSSBlock):
     def __init__(
         self,
         hidden_dim: int = 0,
-        input_resolution: tuple = (224, 224), 
+        input_resolution: tuple = None,  # 改为 None，强制传入
         drop_path: float = 0,
         norm_layer: Callable[..., nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         attn_drop_rate: float = 0,
         d_state: int = 16,
         **kwargs
     ):
+        # 如果没有传入 input_resolution，使用默认值
+        if input_resolution is None:
+            input_resolution = (224, 224)
+            
         super().__init__(
             hidden_dim=hidden_dim,
             input_resolution=input_resolution,
@@ -61,7 +65,8 @@ class VMRNNCell(nn.Module):
         super(VMRNNCell, self).__init__()
 
         self.VSBs = nn.ModuleList(
-            VSB(hidden_dim=hidden_dim, input_resolution=input_resolution,
+            VSB(hidden_dim=hidden_dim, 
+                input_resolution=input_resolution,  # 確保傳入正确的分辨率
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, 
                 norm_layer=norm_layer, attn_drop_rate=attn_drop,
                 d_state=d_state, **kwargs)
@@ -160,6 +165,39 @@ class GeoVMRNN_Supervised(nn.Module):
         else:
             self.patch_size = (4, 4)
             
+        # 計算地理尺寸
+        if hasattr(mypara, 'lat_range') and hasattr(mypara, 'lon_range'):
+            # 根据地理范围计算实际尺寸
+            lat_span = mypara.lat_range[1] - mypara.lat_range[0]
+            lon_span = mypara.lon_range[1] - mypara.lon_range[0]
+            
+            # 如果有分辨率信息，使用分辨率计算
+            if hasattr(mypara, 'resolution'):
+                self.img_height = int(lat_span / mypara.resolution)
+                self.img_width = int(lon_span / mypara.resolution)
+            else:
+                # 否则直接使用度数作为像素数（可能需要调整）
+                self.img_height = int(lat_span)
+                self.img_width = int(lon_span)
+        elif hasattr(mypara, 'H0') and hasattr(mypara, 'W0'):
+            # 如果直接给出了patch后的尺寸
+            self.H0 = mypara.H0
+            self.W0 = mypara.W0
+            self.img_height = self.H0 * self.patch_size[0]
+            self.img_width = self.W0 * self.patch_size[1]
+        else:
+            # 默认值
+            self.img_height = 224
+            self.img_width = 224
+            
+        # 計算patch后的尺寸
+        self.H0 = self.img_height // self.patch_size[0]
+        self.W0 = self.img_width // self.patch_size[1]
+        self.emb_spatial_size = self.H0 * self.W0
+        
+        # 地理输入分辨率（patch后的尺寸）
+        self.geo_input_resolution = (self.H0, self.W0)
+            
         # 計算cube_dim（與Geoformer保持一致）
         if self.mypara.needtauxy:
             self.cube_dim = (
@@ -172,24 +210,6 @@ class GeoVMRNN_Supervised(nn.Module):
             )
             self.input_channels = mypara.input_channal
         
-        # 使用地理patch參數
-        if hasattr(mypara, 'H0') and hasattr(mypara, 'W0'):
-            self.H0 = mypara.H0
-            self.W0 = mypara.W0
-            self.emb_spatial_size = mypara.emb_spatial_size
-        else:
-            # 根據地理範圍計算圖片尺寸
-            if hasattr(mypara, 'lat_range') and hasattr(mypara, 'lon_range'):
-                self.img_height = int(mypara.lat_range[1] - mypara.lat_range[0])
-                self.img_width = int(mypara.lon_range[1] - mypara.lon_range[0])
-            else:
-                self.img_height = 224
-                self.img_width = 224
-            
-            self.H0 = self.img_height // self.patch_size[0]
-            self.W0 = self.img_width // self.patch_size[1]
-            self.emb_spatial_size = self.H0 * self.W0
-        
         # 編碼器：地理空間特徵提取
         self.geo_cnn = nn.Sequential(
             GeoCNN(self.input_channels, 64),
@@ -201,10 +221,10 @@ class GeoVMRNN_Supervised(nn.Module):
         # 嵌入維度
         self.embed_dim = 256
         
-        # 編碼器：VMRNN Cell
+        # 編碼器：VMRNN Cell（使用地理分辨率）
         self.encoder_vmrnn_cell = VMRNNCell(
             hidden_dim=self.embed_dim,
-            input_resolution=(self.H0, self.W0),
+            input_resolution=self.geo_input_resolution,  # 使用地理分辨率
             depth=2,
             drop=0.0,
             attn_drop=0.0,
@@ -213,10 +233,10 @@ class GeoVMRNN_Supervised(nn.Module):
             d_state=16
         )
         
-        # 解碼器：VMRNN Cell（用於自回歸生成）
+        # 解碼器：VMRNN Cell（使用地理分辨率）
         self.decoder_vmrnn_cell = VMRNNCell(
             hidden_dim=self.embed_dim,
-            input_resolution=(self.H0, self.W0),
+            input_resolution=self.geo_input_resolution,  # 使用地理分辨率
             depth=2,
             drop=0.0,
             attn_drop=0.0,
@@ -248,10 +268,19 @@ class GeoVMRNN_Supervised(nn.Module):
             cube_dim=self.cube_dim,
             num_layers=3
         )
+    
+        # 打印調試信息
+        print(f"地理尺寸: {self.img_height} x {self.img_width}")
+        print(f"Patch后尺寸: {self.H0} x {self.W0}")
+        print(f"使用的input_resolution: {self.geo_input_resolution}")
         
     def encode(self, predictor):
         """編碼器：處理歷史數據"""
         batch_size, seq_len, C, H, W = predictor.shape
+        
+        # 验证输入尺寸是否匹配
+        assert H == self.img_height and W == self.img_width, \
+            f"输入尺寸 {H}x{W} 不匹配预期的地理尺寸 {self.img_height}x{self.img_width}"
         
         # 初始化編碼器隱藏狀態
         encoder_hidden = None
@@ -264,6 +293,11 @@ class GeoVMRNN_Supervised(nn.Module):
             # 轉換為patch序列
             patch_feat = self.patch_project(geo_feat)
             B, C_embed, H_patch, W_patch = patch_feat.shape
+            
+            # 验证patch尺寸
+            assert H_patch == self.H0 and W_patch == self.W0, \
+                f"Patch尺寸 {H_patch}x{W_patch} 不匹配预期的 {self.H0}x{self.W0}"
+            
             patch_embed_feat = patch_feat.view(B, C_embed, H_patch * W_patch).permute(0, 2, 1)
             
             # 編碼器VMRNN處理
