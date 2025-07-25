@@ -80,14 +80,14 @@ class VSB(VSSBlock):
     def __init__(
         self,
         hidden_dim: int = 0,
-        input_resolution: tuple = None,  # 改为 None，強制傳入
+        input_resolution: tuple = None,  # None，強制傳入
         drop_path: float = 0,
         norm_layer: Callable[..., nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         attn_drop_rate: float = 0,
         d_state: int = 16,
         **kwargs
     ):
-        # 如果沒有傳入 input_resolution，使用默认值
+        # 如果沒有傳入 input_resolution，使用默認值
         if input_resolution is None:
             input_resolution = (224, 224)
             
@@ -132,7 +132,7 @@ class VMRNNCell(nn.Module):
 
         self.VSBs = nn.ModuleList(
             VSB(hidden_dim=hidden_dim, 
-                input_resolution=input_resolution,  # 確保傳入正确的分辨率
+                input_resolution=input_resolution,  # 確保傳入正確的分辨率
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, 
                 norm_layer=norm_layer, attn_drop_rate=attn_drop,
                 d_state=d_state, **kwargs)
