@@ -170,7 +170,21 @@ for i_file in files[: file_num + 1]:
 
    # -------------【新增：畫 cut_nino_true vs cut_nino_pred】-------------
     fig_debug, ax_debug = plt.subplots(3, 1, figsize=(8, 10), dpi=150)
+
+    # 創建精確的年份軸（每個月份對應正確的年份位置）
+    start_year = 1980
+    start_month = 1  # 假設從1月開始，你可以根據實際情況調整
+    n_data_points = len(cut_nino_true_jx)
     
+    # 創建每個數據點對應的年份
+    years = []
+    for i in range(n_data_points):
+        year = start_year + (start_month - 1 + i) // 12
+        month = (start_month - 1 + i) % 12 + 1
+        years.append(year + (month - 1) / 12)  # 年份 + 月份的小數部分
+    
+    years = np.array(years)
+
     # lead_to_plot = [0, 2, 5]
     lead_to_plot = [8, 11, 19]
 
@@ -188,8 +202,14 @@ for i_file in files[: file_num + 1]:
         ax_debug[i].plot(cut_nino_pred_jx[lead], label=f"Pred", color="red", alpha=0.7)
 
         ax_debug[i].set_title(f"Analyzed data vs Model predicted (lead {lead+1} month)", fontsize=16)
-        ax_debug[i].set_xlabel("Index of time steps", fontsize=14)
+        ax_debug[i].set_xlabel("Year", fontsize=14)
         ax_debug[i].set_ylabel("Niño3.4 index (°C)", fontsize=14)
+
+        # 設置x軸刻度，每5年顯示一次
+        year_ticks = np.arange(1980, 2025, 5)  # 每5年一個刻度
+        ax_debug[i].set_xticks(year_ticks)
+        ax_debug[i].set_xlim(years[0], years[-1])
+
         # ax_debug[i].legend(fontsize=8)
         ax_debug[i].grid(linestyle=":")
 
