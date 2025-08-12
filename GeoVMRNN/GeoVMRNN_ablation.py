@@ -624,95 +624,16 @@ def get_ablation_configs():
     }
     
     # 配置2
-    config_gelu = {
-        'cnn': 'gelu',
-        'fusion': 'relu',
-        'prediction': 'relu'
-    }
-    
-    # 配置3：
-    config_gelu_snake_adaptive = {
-        'cnn': 'gelu',
-        'fusion': 'snake_adaptive',
-        'prediction': 'relu'
-    }
-    
-    cnn_learned = {
-        'cnn': 'snake_learned',
-        'fusion': 'relu',
-        'prediction': 'relu'
-    }
-    
-    # 配置2
     fusion_learned = {
         'cnn': 'relu',
         'fusion': 'snake_learned',
         'prediction': 'relu'
     }
     
-    # 配置3：
-    prediction_learned = {
-        'cnn': 'relu',
-        'fusion': 'relu',
-        'prediction': 'snake_learned'
-    }
-
-    cnn_adaptive = {
-        'cnn': 'snake_adaptive',
-        'fusion': 'relu',
-        'prediction': 'relu'
-    }
-    
-    # 配置2
-    fusion_adaptive = {
-        'cnn': 'relu',
-        'fusion': 'snake_adaptive',
-        'prediction': 'relu'
-    }
-    
-    # 配置3：
-    prediction_adaptive = {
-        'cnn': 'relu',
-        'fusion': 'relu',
-        'prediction': 'snake_adaptive'
-    }
-
-    # # 配置4：
-    # config_mixed_encoder_layers = {
-    #     'cnn': 'relu',
-    #     'encoder': {
-    #         'vsb': ['relu', 'snake_adaptive'],  # 第一層ReLU，第二層Snake
-    #         'gate': 'gelu'  # LSTM門控使用GELU
-    #     },
-    #     'decoder': 'silu',
-    #     'fusion': 'relu',
-    #     'prediction': 'relu'
-    # }
-    
-    # # 配置5：全面混合配置
-    # config_comprehensive_mixed = {
-    #     'cnn': 'gelu',
-    #     'encoder': {
-    #         'vsb': ['snake_learned', 'snake_adaptive'], 
-    #         'gate': 'silu'
-    #     },
-    #     'decoder': {
-    #         'vsb': ['relu', 'snake_fixed'],
-    #         'gate': 'relu'
-    #     },
-    #     'fusion': 'snake_adaptive',
-    #     'prediction': 'relu'
-    # }
     
     return {
-        # 'baseline': config_baseline,
-        # 'gelu': config_gelu,
-        # 'cnn_gelu_fusion_snake': config_gelu_snake_adaptive,
-        'cnn_adaptive':cnn_adaptive,
-        'fusion_adaptive':fusion_adaptive,
-        'prediction_adaptive':prediction_adaptive
-        # 'cnn_learned':cnn_learned,
-        # 'fusion_learned':fusion_learned,
-        # 'prediction_learned':prediction_learned
+        'baseline': config_baseline,
+        'fusion_learned':fusion_learned,
+
 
     }
