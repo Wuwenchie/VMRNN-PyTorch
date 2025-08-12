@@ -1,516 +1,695 @@
-from GeoVMRNN_ablation import create_supervised_geo_vmrnn, get_ablation_configs
-from myconfig import mypara
 import torch
-from torch.utils.data import DataLoader
-import numpy as np
-import math
-from LoadData import make_dataset2, make_testdataset
-from progressive_teacher_forcing import TeacherForcingScheduler, CurriculumTeacherForcing
-import mlflow
-import mlflow.pytorch
+import torch.nn as nn
+import torch.nn.functional as F
+from vmamba import VSSBlock, SS2D
+from typing import Optional, Callable, Dict, Union, List
+from functools import partial
+
+class LearnedSnake(nn.Module):
+    """學習性Snake激活函數"""
+    def __init__(self, in_features=1, a=None):
+        super().__init__()
+        if a is not None:
+            self.a = nn.Parameter(torch.tensor(a))
+        else:
+            self.a = nn.Parameter(torch.ones(1))
+        self.a.requires_grad = True
+        
+    def forward(self, x):
+        return x + torch.square(torch.sin(self.a * x)) / (torch.abs(self.a) + 1e-8)
 
 
-class lrwarm:
-    """學習率預熱調度器"""
-    def __init__(self, model_size, factor, warmup, optimizer):
-        self.optimizer = optimizer
-        self._step = 0
-        self.warmup = warmup
-        self.factor = factor
-        self.model_size = model_size
-        self._rate = 0
+class FixedSnake(nn.Module):
+    """固定參數Snake激活函数"""
+    def __init__(self, a=1.0):
+        super().__init__()
+        self.a = a
+        
+    def forward(self, x):
+        return x + torch.square(torch.sin(self.a * x)) / self.a
 
-    def step(self):
-        self._step += 1
-        rate = self.rate()
-        for p in self.optimizer.param_groups:
-            p["lr"] = rate
-        self._rate = rate
-        self.optimizer.step()
 
-    def rate(self, step=None):
-        if step is None:
-            step = self._step
-        return self.factor * (
-            self.model_size ** (-0.5)
-            * min(step ** (-0.5), step * self.warmup ** (-1.5))
+class AdaptiveSnake(nn.Module):
+    """自適應Snake激活函數"""
+    def __init__(self, in_features):
+        super().__init__()
+        self.a = nn.Parameter(torch.ones(1))
+        self.a.requires_grad = True
+        
+    def forward(self, x):
+        return x + torch.square(torch.sin(self.a * x)) / (torch.abs(self.a) + 1e-8)
+
+
+class ActivationFactory:
+    """激活函數工廠類"""
+    @staticmethod
+    def get_activation(activation_config: Union[str, Dict], hidden_dim: int = None):
+        """
+        根據配置創建激活函數
+        
+        Args:
+            activation_config: 字符串或字典配置
+            hidden_dim: 隱藏維度（某些激活函數需要）
+            
+        Returns:
+            nn.Module: 激活函數
+        """
+        if isinstance(activation_config, str):
+            activation_type = activation_config
+            params = {}
+        else:
+            activation_type = activation_config.get('type', 'relu')
+            params = activation_config.get('params', {})
+        
+        if activation_type == 'relu':
+            return nn.ReLU(inplace=params.get('inplace', True))
+        elif activation_type == 'gelu':
+            return nn.GELU()
+        elif activation_type == 'silu':
+            return nn.SiLU(inplace=params.get('inplace', True))
+        elif activation_type == 'snake_learned':
+            return LearnedSnake(in_features=params.get('in_features', hidden_dim))
+        elif activation_type == 'snake_fixed':
+            return FixedSnake(a=params.get('a', 1.0))
+        elif activation_type == 'snake_adaptive':
+            return AdaptiveSnake(in_features=params.get('in_features', hidden_dim))
+        else:
+            return nn.ReLU(inplace=True)
+        
+class VSB(VSSBlock):
+    def __init__(
+        self,
+        hidden_dim: int = 0,
+        input_resolution: tuple = None,  # None，強制傳入
+        drop_path: float = 0,
+        norm_layer: Callable[..., nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        attn_drop_rate: float = 0,
+        d_state: int = 16,
+        **kwargs
+    ):
+        # 如果沒有傳入 input_resolution，使用默認值
+        if input_resolution is None:
+            input_resolution = (224, 224)
+            
+        super().__init__(
+            hidden_dim=hidden_dim,
+            input_resolution=input_resolution,
+            drop_path=drop_path,
+            norm_layer=norm_layer,
+            attn_drop_rate=attn_drop_rate,
+            d_state=d_state,
+            **kwargs
         )
+        self.linear = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.input_resolution = input_resolution
+
+    def forward(self, x, hx=None):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        
+        shortcut = x
+        x = self.ln_1(x)
+
+        if hx is not None:
+            hx = self.ln_1(hx)
+            x = torch.cat((x, hx), dim=-1)
+            x = self.linear(x)
+        x = x.view(B, H, W, C) 
+
+        x = self.drop_path(self.self_attention(x))
+ 
+        x = x.view(B, H * W, C)
+        x = shortcut + x
+
+        return x
 
 
-class GeoVMRNNMixedActivationTrainer:
-    """GeoVMRNN 混合激活函數模型訓練器"""
-    def __init__(self, mypara, activation_config=None):
-        assert mypara.input_channal == mypara.output_channal
+class VMRNNCell(nn.Module):
+    def __init__(self, hidden_dim, input_resolution, depth,
+                 drop=0., attn_drop=0., drop_path=0., norm_layer=nn.LayerNorm, d_state=16, **kwargs):
+        super(VMRNNCell, self).__init__()
+
+        self.VSBs = nn.ModuleList(
+            VSB(hidden_dim=hidden_dim, 
+                input_resolution=input_resolution,  # 確保傳入正確的分辨率
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path, 
+                norm_layer=norm_layer, attn_drop_rate=attn_drop,
+                d_state=d_state, **kwargs)
+            for i in range(depth))
+
+    def forward(self, xt, hidden_states):
+        if hidden_states is None:
+            B, L, C = xt.shape
+            hx = torch.zeros(B, L, C).to(xt.device)
+            cx = torch.zeros(B, L, C).to(xt.device)
+        else:
+            hx, cx = hidden_states
         
-        # 添加數據維度驗證
-        print("正在驗證數據維度...")
+        outputs = []
+        for index, layer in enumerate(self.VSBs):
+            if index == 0:
+                x = layer(xt, hx)
+                outputs.append(x)
+            else:
+                x = layer(outputs[-1], None)
+                outputs.append(x)
+                
+        o_t = outputs[-1]
+        Ft = torch.sigmoid(o_t)
+        cell = torch.tanh(o_t)
+        Ct = Ft * (cx + cell)
+        Ht = Ft * torch.tanh(Ct)
+
+        return Ht, (Ht, Ct)
+
+class GeoCNN(nn.Module):
+    """地理空間特徵提取卷積模塊"""
+    def __init__(self, in_channels, out_channels, activation_config, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.activation = ActivationFactory.get_activation(activation_config, out_channels)
+        # self.relu = nn.ReLU(inplace=True)
         
+    def forward(self, x):
+        return self.activation(self.bn(self.conv(x)))
+
+
+class SpatialAttention(nn.Module):
+    """空間注意力機制"""
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        attention = self.sigmoid(self.conv(x))
+        return x * attention
+
+class ENSOClassifier(nn.Module):
+    """ENSO現象分類器"""
+    def __init__(self, input_dim, hidden_dim=128):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # Global average pooling
+            nn.Flatten(),
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 3)  # 3 classes: El Niño, Normal, La Niña
+        )
+        
+    def forward(self, x):
+        return self.classifier(x)
+
+
+class AdaptiveFusionModule(nn.Module):
+    """自適應融合模塊，根據ENSO狀態動態選擇激活函數"""
+    def __init__(self, input_channels, hidden_dim=512):
+        super().__init__()
+        
+        # Different activation branches
+        self.relu_branch = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_dim, kernel_size=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.snake_branch = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_dim, kernel_size=1),
+            nn.BatchNorm2d(hidden_dim),
+            LearnedSnake()
+        )
+        
+        # Classification head for determining ENSO state
+        self.enso_classifier = ENSOClassifier(input_channels, hidden_dim=128)
+        
+        # Attention weights for fusion
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(input_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3),  # 3 activation branches
+            nn.Softmax(dim=1)
+        )
+        
+    def forward(self, x):
+        # Get features from different activation branches
+        relu_feat = self.relu_branch(x)
+        snake_feat = self.snake_branch(x)
+        
+        # Get ENSO classification
+        enso_logits = self.enso_classifier(x)
+        enso_probs = F.softmax(enso_logits, dim=1)
+        
+        # Get attention weights
+        attention_weights = self.attention(x)
+        
+        # Adaptive fusion based on ENSO classification
+        # El Niño (class 0) -> prefer ReLU
+        # Normal (class 1) -> balanced
+        # La Niña (class 2) -> prefer Snake
+        fused_features = (
+            attention_weights[:, 0:1].unsqueeze(-1).unsqueeze(-1) * relu_feat +
+            attention_weights[:, 1:2].unsqueeze(-1).unsqueeze(-1) * snake_feat +
+            attention_weights[:, 2:3].unsqueeze(-1).unsqueeze(-1) * snake_feat
+        )
+        
+        return fused_features, enso_logits, attention_weights
+        
+class SupervisedPredictionHead(nn.Module):
+    """支持監督式學習的預測頭"""
+    def __init__(self, input_dim, cube_dim, activation_config, num_layers=2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.cube_dim = cube_dim
+        self.num_layers = num_layers
+        
+        layers = []
+        hidden_dim = input_dim // 2
+        
+        for i in range(num_layers):
+            if i == 0:
+                layers.append(nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1))
+            elif i == num_layers - 1:
+                layers.append(nn.Conv2d(hidden_dim, cube_dim, kernel_size=3, padding=1))
+            else:
+                layers.append(nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1))
+            
+            if i < num_layers - 1:
+                layers.append(nn.BatchNorm2d(hidden_dim))
+                activation = ActivationFactory.get_activation(activation_config, hidden_dim)
+                layers.append(activation)
+        
+        self.prediction_layers = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.prediction_layers(x)
+
+
+class EnhancedGeoVMRNN_Supervised(nn.Module):
+    """增強的GeoVMRNN模型，支持ENSO分類和自適應激活函數"""
+    def __init__(self, mypara, activation_config=None, use_adaptive_fusion=True):
+        super().__init__()
         self.mypara = mypara
         self.device = mypara.device
-        # self.activation_config = activation_config or 'relu'
+        self.use_adaptive_fusion = use_adaptive_fusion
+
+        # 默認激活函數配置
+        if activation_config is None:
+            activation_config = 'relu'
         self.activation_config = activation_config
-                
-        # 創建混合激活函數模型
-        self.mymodel = create_supervised_geo_vmrnn(
-            mypara, 
-            activation_config=self.activation_config
-        ).to(mypara.device)
-        
-        # 添加模型參數統計
-        total_params = sum(p.numel() for p in self.mymodel.parameters())
-        trainable_params = sum(p.numel() for p in self.mymodel.parameters() if p.requires_grad)
-        print(f"模型總參數: {total_params:,}")
-        print(f"可訓練參數: {trainable_params:,}")
-        print(f"使用混合激活函數配置: {self.activation_config}")
-        
-        # 設置優化器和學習率調度器
-        adam = torch.optim.Adam(self.mymodel.parameters(), lr=0)
-        factor = math.sqrt(mypara.d_size * mypara.warmup) * 0.0015
-        self.opt = lrwarm(mypara.d_size, factor, mypara.warmup, optimizer=adam)
-        
-        # 設置 SST 層級
-        self.sstlevel = 0
-        if self.mypara.needtauxy:
-            self.sstlevel = 2
-        
-        # 設置 Nino 指數權重
-        ninoweight = torch.from_numpy(
-            np.array([1.5] * 4 + [2] * 7 + [3] * 7 + [4] * 6)
-            * np.log(np.arange(24) + 1)
-        ).to(mypara.device)
-        self.ninoweight = ninoweight[: self.mypara.output_length]
 
-        self.tf_scheduler = self.create_teacher_forcing_scheduler(mypara)
-        self.tf_ratio_history = []
-
-    def create_teacher_forcing_scheduler(self, mypara):
-        """創建 Teacher Forcing 調度器"""
-        # 从配置中获取策略设置
-        tf_strategy = getattr(mypara, 'tf_strategy', 'exponential')
-        
-        if tf_strategy == 'curriculum':
-            # 使用课程学习调度器
-            return CurriculumTeacherForcing(
-                num_stages=getattr(mypara, 'tf_num_stages', 3),
-                stage_steps=getattr(mypara, 'tf_stage_steps', 2000),
-                strategies=[
-                    {
-                        'strategy': 'exponential',
-                        'initial_ratio': 1.0,
-                        'final_ratio': 0.7,
-                        'decay_rate': 0.9998
-                    },
-                    {
-                        'strategy': 'linear',
-                        'initial_ratio': 0.7,
-                        'final_ratio': 0.2,
-                        'total_steps': 2000
-                    },
-                    {
-                        'strategy': 'cosine',
-                        'initial_ratio': 0.2,
-                        'final_ratio': 0.0,
-                        'total_steps': 2000
-                    }
-                ]
-            )
+        # 使用與 Geoformer 相同的 patch 參數
+        if hasattr(mypara, 'patch_size'):
+            self.patch_size = mypara.patch_size
         else:
-            # 单一策略调度器的配置
-            scheduler_configs = {
-                'exponential': {
-                    'strategy': 'exponential',
-                    'initial_ratio': getattr(mypara, 'tf_initial_ratio', 1.0),
-                    'final_ratio': getattr(mypara, 'tf_final_ratio', 0.0),
-                    'decay_rate': getattr(mypara, 'tf_decay_rate', 0.9999)
-                },
-                'linear': {
-                    'strategy': 'linear',
-                    'initial_ratio': getattr(mypara, 'tf_initial_ratio', 1.0),
-                    'final_ratio': getattr(mypara, 'tf_final_ratio', 0.0),
-                    'total_steps': getattr(mypara, 'tf_total_steps', 10000)
-                },
-                'cosine': {
-                    'strategy': 'cosine',
-                    'initial_ratio': getattr(mypara, 'tf_initial_ratio', 1.0),
-                    'final_ratio': getattr(mypara, 'tf_final_ratio', 0.0),
-                    'total_steps': getattr(mypara, 'tf_total_steps', 10000)
-                },
-                'step': {
-                    'strategy': 'step',
-                    'initial_ratio': getattr(mypara, 'tf_initial_ratio', 1.0),
-                    'final_ratio': getattr(mypara, 'tf_final_ratio', 0.0),
-                    'step_size': getattr(mypara, 'tf_step_size', 1000),
-                    'gamma': getattr(mypara, 'tf_gamma', 0.5)
-                },
-                'adaptive': {
-                    'strategy': 'adaptive',
-                    'initial_ratio': getattr(mypara, 'tf_initial_ratio', 1.0),
-                    'final_ratio': getattr(mypara, 'tf_final_ratio', 0.0),
-                    'patience': getattr(mypara, 'tf_patience', 200),
-                    'threshold': getattr(mypara, 'tf_threshold', 0.01),
-                    'reduction_factor': getattr(mypara, 'tf_reduction_factor', 0.8)
-                }
-            }
+            self.patch_size = (4, 4)
             
-            config = scheduler_configs.get(tf_strategy, scheduler_configs['exponential'])
-            return TeacherForcingScheduler(**config)
-
-    def get_model_name(self):
-        """根據激活函數配置生成模型名稱"""
-        if isinstance(self.activation_config, str):
-            return f"GeoVMRNN_Mixed_{self.activation_config}.pkl"
-        elif isinstance(self.activation_config, dict):
-            # 創建簡短的配置描述
-            parts = []
-            for key, value in self.activation_config.items():
-                if isinstance(value, str):
-                    parts.append(f"{key}_{value}")
-                elif isinstance(value, dict):
-                    # 對於嵌套字典，只取主要信息
-                    main_info = value.get('vsb', value.get('type', 'mixed'))
-                    if isinstance(main_info, list):
-                        main_info = '_'.join(main_info[:2])  # 只取前兩個
-                    parts.append(f"{key}_{main_info}")
-            config_str = '_'.join(parts[:3])  # 限制長度
-            return f"GeoVMRNN_Mixed_{config_str}.pkl"
-        else:
-            return "GeoVMRNN_Mixed_custom.pkl"
-        
-    def calscore(self, y_pred, y_true):
-        """計算 Nino 評分"""
-        with torch.no_grad():
-            pred = y_pred - y_pred.mean(dim=0, keepdim=True)
-            true = y_true - y_true.mean(dim=0, keepdim=True)
-            cor = (pred * true).sum(dim=0) / (
-                torch.sqrt(torch.sum(pred ** 2, dim=0) * torch.sum(true ** 2, dim=0))
-                + 1e-6
-            )
-            acc = (self.ninoweight * cor).sum()
-            rmse = torch.mean((y_pred - y_true) ** 2, dim=0).sqrt().sum()
-            sc = 2 / 3.0 * acc - rmse
-        return sc.item()
-
-    def loss_var(self, y_pred, y_true, residual_losses=None, alpha=1.0):
-        """計算變量損失"""
-        # Ensure y_pred and y_true have the same sequence length
-        min_len = min(y_pred.size(1), y_true.size(1))
-        y_pred = y_pred[:, :min_len]
-        y_true = y_true[:, :min_len]
-        
-        # Calculate RMSE over spatial dimensions first
-        rmse = torch.mean((y_pred - y_true) ** 2, dim=[3, 4])  # Average over height and width
-        
-        # Average over batch dimension
-        rmse = rmse.mean(dim=0)  # Average over batch
-        
-        # Sum over remaining dimensions (sequence and channels)
-        rmse = rmse.sum()
-        
-        # 處理 residual_losses
-        if residual_losses is not None:
-            # 如果 residual_losses 是 tensor，直接使用
-            if isinstance(residual_losses, torch.Tensor):
-                residual_term = alpha * residual_losses
+        # 計算地理尺寸
+        if hasattr(mypara, 'lat_range') and hasattr(mypara, 'lon_range'):
+            # 根據地理範圍計算实际尺寸
+            lat_span = mypara.lat_range[1] - mypara.lat_range[0]
+            lon_span = mypara.lon_range[1] - mypara.lon_range[0]
+            
+            # 如果有分辨率信息，使用分辨率計算
+            if hasattr(mypara, 'resolution'):
+                self.img_height = int(lat_span / mypara.resolution)
+                self.img_width = int(lon_span / mypara.resolution)
             else:
-                # 如果是其他類型（如 float），轉換為 tensor
-                residual_term = alpha * torch.tensor(residual_losses, device=rmse.device)
+                # 否則直接使用度數作為像素數（可能需要調整）
+                self.img_height = int(lat_span)
+                self.img_width = int(lon_span)
+                
+        elif hasattr(mypara, 'H0') and hasattr(mypara, 'W0'):
+            # 如果直接給出了patch后的尺寸
+            self.H0 = mypara.H0
+            self.W0 = mypara.W0
+            self.img_height = self.H0 * self.patch_size[0]
+            self.img_width = self.W0 * self.patch_size[1]
         else:
-            # 如果沒有提供 residual_losses，設為 0
-            residual_term = torch.tensor(0.0, device=rmse.device)
-        
-        total_loss = rmse + residual_term
-        return total_loss
-
-    def loss_nino(self, y_pred, y_true):
-        """計算 Nino 損失"""
-        rmse = torch.sqrt(torch.mean((y_pred - y_true) ** 2, dim=0))
-        return rmse.sum()
-
-    def combine_loss(self, loss1, loss2):
-        """組合損失函數"""
-        combine_loss = loss1 + loss2
-        return combine_loss
-
-    def model_pred(self, dataloader):
-        """模型預測和評估"""
-        self.mymodel.eval()
-        nino_pred = []
-        var_pred = []
-        nino_true = []
-        var_true = []
-        
-        with torch.no_grad():
-            for input_var, var_true1 in dataloader:
-                # 提取真實 SST 和 Nino 指數
-                SST = var_true1[:, :, self.sstlevel]
-                nino_true1 = SST[
-                    :,
-                    :,
-                    self.mypara.lat_nino_relative[0] : self.mypara.lat_nino_relative[1],
-                    self.mypara.lon_nino_relative[0] : self.mypara.lon_nino_relative[1],
-                ].mean(dim=[2, 3])
-                
-                # 模型預測
-                out_var, residual_loss = self.mymodel(
-                    input_var.float().to(self.device),
-                    predictand=None,
-                    train=False,
-                )
-                
-                # 提取預測的 SST 和 Nino 指數
-                SST_out = out_var[:, :, self.sstlevel]
-                out_nino = SST_out[
-                    :,
-                    :,
-                    self.mypara.lat_nino_relative[0] : self.mypara.lat_nino_relative[1],
-                    self.mypara.lon_nino_relative[0] : self.mypara.lon_nino_relative[1],
-                ].mean(dim=[2, 3])
-                
-                # 收集預測和真實值
-                var_true.append(var_true1)
-                nino_true.append(nino_true1)
-                var_pred.append(out_var)
-                nino_pred.append(out_nino)
+            # 默認值
+            self.img_height = 224
+            self.img_width = 224
             
-            # 拼接所有批次的結果
-            var_pred = torch.cat(var_pred, dim=0)
-            nino_pred = torch.cat(nino_pred, dim=0)
-            nino_true = torch.cat(nino_true, dim=0)
-            var_true = torch.cat(var_true, dim=0)
-            
-            # 計算評估指標
-            ninosc = self.calscore(nino_pred, nino_true.float().to(self.device))
-            loss_var = self.loss_var(var_pred, var_true.float().to(self.device), residual_losses=None).item()
-            loss_nino = self.loss_nino(
-                nino_pred, nino_true.float().to(self.device)
-            ).item()
-            combine_loss = self.combine_loss(loss_var, loss_nino)
-            
-        return (
-            var_pred,
-            nino_pred,
-            loss_var,
-            loss_nino,
-            combine_loss,
-            ninosc,
-        )
-
-    def train_model(self, dataset_train, dataset_eval):
-        """訓練模型"""
-        # 根據激活函數配置修改模型保存路徑
-        model_name = self.get_model_name()
-        chk_path = self.mypara.model_savepath + model_name
-        torch.manual_seed(self.mypara.seeds)
+        # 計算patch後的尺寸
+        self.H0 = self.img_height // self.patch_size[0]
+        self.W0 = self.img_width // self.patch_size[1]
+        self.emb_spatial_size = self.H0 * self.W0
         
-        # 創建數據加載器
-        dataloader_train = DataLoader(
-            dataset_train, batch_size=self.mypara.batch_size_train, shuffle=False
-        )
-        dataloader_eval = DataLoader(
-            dataset_eval, batch_size=self.mypara.batch_size_eval, shuffle=False
+        # 地理輸入分辨率（patch後的尺寸）
+        self.geo_input_resolution = (self.H0, self.W0)
+            
+        # 計算cube_dim（與Geoformer保持一致）
+        if self.mypara.needtauxy:
+            self.cube_dim = mypara.input_channal + 2
+            self.input_channels = mypara.input_channal + 2
+        else:
+            self.cube_dim = mypara.input_channal
+            self.input_channels = mypara.input_channal
+
+        # 處理激活函數配置
+        cnn_config, fusion_config, pred_config = self._parse_activation_config()
+
+        # 編碼器：地理空間特徵提取
+        self.geo_cnn = nn.Sequential(
+            GeoCNN(self.input_channels, 64, activation_config=cnn_config),
+            GeoCNN(64, 128, activation_config=cnn_config),
+            GeoCNN(128, 256, activation_config=cnn_config),
+            SpatialAttention(256)
         )
         
-        count = 0
-        best = -math.inf
-        global_step = 0
+        # 嵌入維度
+        self.embed_dim = 256
+        
+        # 編碼器：VMRNN Cell（使用地理分辨率）
+        self.encoder_vmrnn_cell = VMRNNCell(
+            hidden_dim=self.embed_dim,
+            input_resolution=self.geo_input_resolution,  # 使用地理分辨率
+            depth=2,
+            drop=0.0,
+            attn_drop=0.0,
+            drop_path=0.0,
+            norm_layer=nn.LayerNorm,
+            d_state=16
+        )
+        
+        # 解碼器：VMRNN Cell（使用地理分辨率）
+        self.decoder_vmrnn_cell = VMRNNCell(
+            hidden_dim=self.embed_dim,
+            input_resolution=self.geo_input_resolution,  # 使用地理分辨率
+            depth=2,
+            drop=0.0,
+            attn_drop=0.0,
+            drop_path=0.0,
+            norm_layer=nn.LayerNorm,
+            d_state=16
+        )
+        
+        # patch嵌入層
+        self.patch_project = nn.Conv2d(256, self.embed_dim, 
+                                     kernel_size=self.patch_size, 
+                                     stride=self.patch_size)
+        
+        # 將patch序列轉換回圖像格式
+        self.patch_to_img = nn.ConvTranspose2d(
+            in_channels=self.embed_dim,
+            out_channels=256,
+            kernel_size=self.patch_size,
+            stride=self.patch_size
+        )
+        
+        # 特徵融合層
+        # Replace fusion layer with adaptive fusion if enabled
+        if self.use_adaptive_fusion:
+            self.adaptive_fusion = AdaptiveFusionModule(
+                input_channels=256 + 256,  # geo_feat + vmrnn_feat
+                hidden_dim=512
+            )
+        else:
+            # Keep original fusion
+            self.fusion_conv = nn.Conv2d(256 + 256, 512, kernel_size=1)
+            self.fusion_norm = nn.BatchNorm2d(512)
+            self.fusion_activation = ActivationFactory.get_activation(
+                activation_config.get('fusion', 'relu') if isinstance(activation_config, dict) else 'relu', 
+                512
+            )
 
-        print(f"使用 Teacher Forcing 調度策略: {self.tf_scheduler.strategy}")
+        
+        # 監督式預測頭（每次只預測一個時間步）
+        self.prediction_head = SupervisedPredictionHead(
+            input_dim=512,
+            cube_dim=self.cube_dim,
+            num_layers=3,
+            activation_config=pred_config
+        )
+      
+        # 初始化誤差預測
+        self.residual_head = SupervisedPredictionHead(
+            input_dim=512,  # 或與 fusion_conv 輸出一致
+            cube_dim=self.cube_dim,
+            num_layers=2,
+            activation_config=pred_config
+        )
+        # self.error_correction_ann = ErrorCorrectionANN(input_dim=self.cube_dim)
+        
+        # 打印調試信息
+        print(f"地理尺寸: {self.img_height} x {self.img_width}")
+        print(f"Patch后尺寸: {self.H0} x {self.W0}")
+        print(f"使用的input_resolution: {self.geo_input_resolution}")
         print(f"使用混合激活函數配置: {self.activation_config}")
-        print(f"模型將保存到: {chk_path}")
+        self._print_activation_summary()
 
-        mlflow.set_tracking_uri("http://localhost:5001")
-        # 根據激活函數配置設置實驗名稱
+    def _parse_activation_config(self):
+        """解析激活函數配置"""
         if isinstance(self.activation_config, str):
-            experiment_name = f"GeoVMRNN_Mixed_{self.activation_config}"
+            # 全部使用相同激活函數
+            return (self.activation_config,) * 3
+        elif isinstance(self.activation_config, dict):
+            # 字典形式配置
+            cnn_config = self.activation_config.get('cnn', 'relu')
+            fusion_config = self.activation_config.get('fusion', 'relu')
+            pred_config = self.activation_config.get('prediction', 'relu')
+            return cnn_config, fusion_config, pred_config
         else:
-            experiment_name = "GeoVMRNN_Mixed_Custom"
-        mlflow.set_experiment(experiment_name)
+            return ('relu',) * 3
+
+    def _print_activation_summary(self):
+        """打印激活函數使用摘要"""
+        cnn_config, fusion_config, pred_config = self._parse_activation_config()
         
-        with mlflow.start_run():
-            mlflow.set_tag("model", "GeoVMRNN_MixedActivation")
-            mlflow.set_tag("activation_config", str(self.activation_config))
-            mlflow.log_params({
-                "activation_config": str(self.activation_config),
-                "lr_factor": self.opt.factor,
-                "warmup": self.opt.warmup,
-                "d_model": self.mypara.d_size,
-                "batch_size": self.mypara.batch_size_train,
-                "epochs": self.mypara.num_epochs,
-                "tf_strategy": self.tf_scheduler.strategy
-            })
+        print("激活函數配置摘要:")
+        print(f"  CNN特徵提取層: {cnn_config}")
+        print(f"  特徵融合層: {fusion_config}")
+        print(f"  預測頭: {pred_config}")
         
-            for i_epoch in range(self.mypara.num_epochs):
-                print("==========" * 8)
-                print(f"\n-->epoch: {i_epoch}")
+    def encode(self, predictor):
+        """編碼器：處理歷史數據"""
+        batch_size, seq_len, C, H, W = predictor.shape
+        # print(f"Encode - Input shape: {predictor.shape}")
+        
+        # 验证输入尺寸是否匹配
+        assert H == self.img_height and W == self.img_width, \
+            f"输入尺寸 {H}x{W} 不匹配预期的地理尺寸 {self.img_height}x{self.img_width}"
+        
+        # 初始化編碼器隱藏狀態
+        encoder_hidden = None
+        
+        # 編碼所有歷史時間步
+        for t in range(seq_len):
+            # 地理空間特徵提取
+            geo_feat = self.geo_cnn(predictor[:, t])
+            # print(f"Encode - After CNN shape at step {t}: {geo_feat.shape}")
+            
+            # 轉換為patch序列
+            patch_feat = self.patch_project(geo_feat)
+            B, C_embed, H_patch, W_patch = patch_feat.shape
+            # print(f"Encode - After patch projection shape at step {t}: {patch_feat.shape}")
+            
+            # 验证patch尺寸
+            assert H_patch == self.H0 and W_patch == self.W0, \
+                f"Patch尺寸 {H_patch}x{W_patch} 不匹配预期的 {self.H0}x{self.W0}"
+            
+            patch_embed_feat = patch_feat.view(B, C_embed, H_patch * W_patch).permute(0, 2, 1)
+            # print(f"Encode - After reshape and permute at step {t}: {patch_embed_feat.shape}")
+            
+            # 編碼器VMRNN處理
+            encoded_feat, encoder_hidden = self.encoder_vmrnn_cell(patch_embed_feat, encoder_hidden)
+            # print(f"Encode - After VMRNN at step {t}: {encoded_feat.shape}")
+        
+        # print(f"Encode - Final output shape: {encoded_feat.shape}")
+        return encoded_feat, encoder_hidden
+
+    def enhanced_decode_step_with_residual(self, current_input, encoder_output, decoder_hidden):
+        """
+        增強的解碼步驟，包含自適應融合和殘差校正
+        """
+        # Original decode steps (same as your decode_step method)
+        geo_feat = self.geo_cnn(current_input)
+        patch_feat = self.patch_project(geo_feat)
+        B, C_embed, H_patch, W_patch = patch_feat.shape
+        patch_embed_feat = patch_feat.view(B, C_embed, H_patch * W_patch).permute(0, 2, 1)
+        
+        decoded_feat, new_decoder_hidden = self.decoder_vmrnn_cell(patch_embed_feat, decoder_hidden)
+        decoded_img = decoded_feat.permute(0, 2, 1).view(B, self.embed_dim, H_patch, W_patch)
+        vmrnn_feat = self.patch_to_img(decoded_img)
+        
+        encoder_img = encoder_output.permute(0, 2, 1).view(B, self.embed_dim, H_patch, W_patch)
+        encoder_feat = self.patch_to_img(encoder_img)
+        
+        # Concatenate features for fusion
+        combined_features = torch.cat([geo_feat, vmrnn_feat], dim=1)
+        
+        # Apply adaptive or standard fusion
+        if self.use_adaptive_fusion:
+            fused_features, enso_logits, attention_weights = self.adaptive_fusion(combined_features)
+        else:
+            fused_features = self.fusion_activation(
+                self.fusion_norm(self.fusion_conv(combined_features))
+            )
+            enso_logits = None
+            attention_weights = None
+        
+        # 粗預測頭 (coarse prediction)
+        coarse_prediction = self.prediction_head(fused_features)
+        
+        # 殘差預測頭 (residual prediction)  
+        residual_prediction = self.residual_head(fused_features)
+        
+        # 最終預測 = 粗預測 + 殘差校正
+        final_prediction = coarse_prediction + residual_prediction
+        
+        # Reshape to original dimensions
+        H, W = current_input.shape[-2:]
+        coarse_prediction = coarse_prediction.view(B, self.cube_dim, H, W)
+        residual_prediction = residual_prediction.view(B, self.cube_dim, H, W)
+        final_prediction = final_prediction.view(B, self.cube_dim, H, W)
+        
+        return final_prediction, coarse_prediction, residual_prediction, enso_logits, attention_weights, new_decoder_hidden
+
+        def forward(self, predictor, predictand=None, train=True, sv_ratio=0):
+        """
+        前向傳播，支持ENSO分類並保留殘差校正結構
+        """
+        batch_size, seq_len, C, H, W = predictor.shape
+        
+        # 1. Encoding phase
+        encoder_output, encoder_hidden = self.encode(predictor)
+        
+        # 2. Decoding phase with enhanced fusion and residual correction
+        if train:
+            assert predictand is not None, "在訓練模式下必須提供 predictand"
+            
+            decoder_hidden = encoder_hidden
+            outputs = []
+            classification_losses = []
+            attention_weights_list = []
+            mse = nn.MSELoss()
+            residual_losses = []
+            
+            current_input = predictor[:, -1]
+            
+            for t in range(self.mypara.output_length):
+                # Enhanced decode step with residual correction
+                next_step, coarse_pred, residual_pred, enso_logits, attention_weights, decoder_hidden = \
+                    self.enhanced_decode_step_with_residual(current_input, encoder_output, decoder_hidden)
                 
-                # 訓練階段
-                self.mymodel.train()
-                for j, (input_var, var_true) in enumerate(dataloader_train):
-                    # 提取真實 SST 和 Nino 指數
-                    SST = var_true[:, :, self.sstlevel]
-                    nino_true = SST[
-                        :,
-                        :,
-                        self.mypara.lat_nino_relative[0] : self.mypara.lat_nino_relative[1],
-                        self.mypara.lon_nino_relative[0] : self.mypara.lon_nino_relative[1],
-                    ].mean(dim=[2, 3])
-                    
-                    # 獲取當前的 Teacher Forcing 比例
-                    current_tf_ratio = self.tf_scheduler.get_ratio()
-                    
-                    # 前向傳播
-                    var_pred, residual_loss = self.mymodel(
-                        input_var.float().to(self.device),
-                        var_true.float().to(self.device),
-                        train=True,
-                        sv_ratio=current_tf_ratio,
-                    )
-                    
-                    # 提取預測的 SST 和 Nino 指數
-                    SST_pred = var_pred[:, :, self.sstlevel]
-                    nino_pred = SST_pred[
-                        :,
-                        :,
-                        self.mypara.lat_nino_relative[0] : self.mypara.lat_nino_relative[1],
-                        self.mypara.lon_nino_relative[0] : self.mypara.lon_nino_relative[1],
-                    ].mean(dim=[2, 3])
-                    
-                    # 計算損失
-                    self.opt.optimizer.zero_grad()
-                    loss_var = self.loss_var(var_pred, var_true.float().to(self.device), residual_loss)
-                    loss_nino = self.loss_nino(nino_pred, nino_true.float().to(self.device))
-                    score = self.calscore(nino_pred, nino_true.float().to(self.device))
-                    combine_loss = self.combine_loss(loss_var, loss_nino)
-                    
-                    # 反向傳播
-                    combine_loss.backward()
-                    self.opt.step()
-
-                    # 更新 Teacher Forcing 調度器
-                    if self.tf_scheduler.strategy == 'adaptive':
-                        # 自适应调度需要提供当前性能分数
-                        self.tf_scheduler.step(score)
-                    else:
-                        # 其他调度策略不需要性能分数
-                        self.tf_scheduler.step()
-                        
-                    mlflow.log_metric("Train/Loss_Var", loss_var.item(), step=global_step)
-                    mlflow.log_metric("Train/Loss_Nino", loss_nino.item(), step=global_step)
-                    mlflow.log_metric("Train/Combine_Loss", combine_loss.item(), step=global_step)
-                    mlflow.log_metric("Train/Score", score, step=global_step)
-                    mlflow.log_metric("Train/tf_ratio", current_tf_ratio, step=global_step)
-                    mlflow.log_metric("Train/Loss_Residual", residual_loss.item(), step=global_step)
-                    global_step += 1
-
-                    # 打印訓練進度
-                    if j % 100 == 0:
-                        print(
-                            f"\n-->batch:{j} loss_var:{loss_var:.2f}, loss_nino:{loss_nino:.2f}, score:{score:.3f}, mixed_activation"
-                        )
-
-                    # 密集驗證
-                    if (i_epoch + 1 >= 4) and (j + 1) % 200 == 0:
-                        (
-                            _,
-                            _,
-                            lossvar_eval,
-                            lossnino_eval,
-                            comloss_eval,
-                            sceval,
-                        ) = self.model_pred(dataloader=dataloader_eval)
-                        
-                        print(
-                            f"-->Evaluation... \nloss_var:{lossvar_eval:.3f} \nloss_nino:{lossnino_eval:.3f} \nloss_com:{comloss_eval:.3f} \nscore:{sceval:.3f}"
-                        )
-                        mlflow.log_metric("Eval/Loss_Var", lossvar_eval, step=global_step)
-                        mlflow.log_metric("Eval/Loss_Nino", lossnino_eval, step=global_step)
-                        mlflow.log_metric("Eval/Combine_Loss", comloss_eval, step=global_step)
-                        mlflow.log_metric("Eval/Score", sceval, step=global_step)
-
-                        if sceval > best:
-                            torch.save(self.mymodel.state_dict(), chk_path)
-                            best = sceval
-                            count = 0
-                            print(f"\nsaving model with mixed activation...")
+                outputs.append(next_step)
                 
-                # 每個 epoch 結束後的評估
-                (
-                    _,
-                    _,
-                    lossvar_eval,
-                    lossnino_eval,
-                    comloss_eval,
-                    sceval,
-                ) = self.model_pred(dataloader=dataloader_eval)
+                # 殘差監督：(真實值 - 粗預測) 作為殘差目標
+                residual_target = predictand[:, t] - coarse_pred
+                loss_r = mse(residual_pred, residual_target)
+                residual_losses.append(loss_r)
                 
-                print(
-                    f"\n-->epoch{i_epoch} end... \nloss_var:{lossvar_eval:.3f} \nloss_nino:{lossnino_eval:.3f} \nloss_com:{comloss_eval:.3f} \nscore: {sceval:.3f}"
+                # 收集分類和注意力權重信息
+                if enso_logits is not None:
+                    classification_losses.append(enso_logits)
+                    attention_weights_list.append(attention_weights)
+                
+                # Teacher forcing
+                if t < self.mypara.output_length - 1:
+                    current_input = predictand[:, t]
+            
+            outvar_pred = torch.stack(outputs, dim=1)
+            
+            # 應用監督比例（Teacher Forcing with mixed input）
+            if sv_ratio > 1e-7:
+                supervise_mask = torch.bernoulli(
+                    sv_ratio * torch.ones(batch_size, self.mypara.output_length - 1, 1, 1, 1)
+                ).to(self.device)
+                
+                # 混合真實值和預測值
+                mixed_predictand = (
+                    supervise_mask * predictand[:, :-1] + 
+                    (1 - supervise_mask) * outvar_pred[:, :-1]
                 )
                 
-                mlflow.log_metric("Epoch/Loss_Var", lossvar_eval, step=i_epoch)
-                mlflow.log_metric("Epoch/Loss_Nino", lossnino_eval, step=i_epoch)
-                mlflow.log_metric("Epoch/Combine_Loss", comloss_eval, step=i_epoch)
-                mlflow.log_metric("Epoch/Score", sceval, step=i_epoch)
-
-                # 檢查是否需要保存模型
-                if sceval <= best:
-                    count += 1
-                    print(f"\nsc is not increase for {count} epoch")
-                else:
-                    count = 0
-                    print(
-                        f"\nsc is increase from {best:.3f} to {sceval:.3f} with mixed activation \nsaving model...\n"
-                    )
-                    torch.save(self.mymodel.state_dict(), chk_path)
-                    best = sceval
+                # 重新進行預測
+                decoder_hidden = encoder_hidden
+                outputs = []
+                residual_losses = []
+                classification_losses = []
+                attention_weights_list = []
+                current_input = predictor[:, -1]
                 
-                # 早停檢查
-                if count == self.mypara.patience:
-                    print(
-                        f"\n-----!!!early stopping reached, max(sceval)= {best:.3f} with mixed activation!!!-----"
-                    )
-                    break
+                for t in range(self.mypara.output_length):
+                    next_step, coarse_pred, residual_pred, enso_logits, attention_weights, decoder_hidden = \
+                        self.enhanced_decode_step_with_residual(current_input, encoder_output, decoder_hidden)
+                    
+                    outputs.append(next_step)
+                    
+                    # 殘差監督
+                    residual_target = predictand[:, t] - coarse_pred
+                    loss_r = mse(residual_pred, residual_target)
+                    residual_losses.append(loss_r)
+                    
+                    # 收集分類信息
+                    if enso_logits is not None:
+                        classification_losses.append(enso_logits)
+                        attention_weights_list.append(attention_weights)
+                    
+                    # 使用混合的輸入
+                    if t < self.mypara.output_length - 1:
+                        current_input = mixed_predictand[:, t]
+                
+                outvar_pred = torch.stack(outputs, dim=1)
+            
+            # 計算平均殘差損失
+            mean_residual_loss = torch.stack(residual_losses).mean()
+            
+            # 處理分類結果
+            if classification_losses:
+                avg_enso_logits = torch.stack(classification_losses).mean(dim=0)
+                avg_attention_weights = torch.stack(attention_weights_list).mean(dim=0)
+                return outvar_pred, mean_residual_loss, avg_enso_logits, avg_attention_weights
+            else:
+                return outvar_pred, mean_residual_loss, None, None
         
-        del self.mymodel
+        else:
+            # 推理模式：自回歸生成
+            decoder_hidden = encoder_hidden
+            outputs = []
+            residual_losses = []
+            current_input = predictor[:, -1]
+            
+            for t in range(self.mypara.output_length):
+                next_step, coarse_pred, residual_pred, enso_logits, attention_weights, decoder_hidden = \
+                    self.enhanced_decode_step_with_residual(current_input, encoder_output, decoder_hidden)
+                
+                outputs.append(next_step)
+                current_input = next_step  # 使用預測結果作為下一步輸入
+                
+                # 推理模式下設置殘差損失為零（沒有真實值可比較）
+                if predictand is not None:
+                    mse = nn.MSELoss()
+                    residual_target = predictand[:, t] - coarse_pred
+                    loss_r = mse(residual_pred, residual_target)
+                    residual_losses.append(loss_r)
+                else:
+                    residual_losses.append(torch.tensor(0.0, device=self.device))
+            
+            outvar_pred = torch.stack(outputs, dim=1)
+            
+            # 返回平均殘差損失
+            mean_residual_loss = torch.stack(residual_losses).mean() if residual_losses else torch.tensor(0.0, device=self.device)
+            
+            return outvar_pred, mean_residual_loss, None, None
+    
+    def predict(self, predictor):
+        """推理模式"""
+        return self.forward(predictor, train=False)
 
+# 添加維度檢查
+def check_dimensions(self, x, stage):
+    print(f"{stage}: {x.shape}")
+    return x
 
-def train_with_mixed_activation(activation_config=None, config_name="custom"):
-    """使用指定混合激活函數配置訓練模型"""
-    print(f"\n{'='*60}")
-    print(f"開始訓練使用 {config_name} 混合激活函數配置的模型")
-    print(f"激活函數配置: {activation_config}")
-    print(f"{'='*60}")
-    
-    print(mypara.__dict__)
-    print(f"\nloading pre-train dataset for {config_name} mixed activation model...")
-    traindataset = make_dataset2(mypara)
-    print(traindataset.selectregion())
-    
-    print(f"\nloading evaluation dataset for {config_name} mixed activation model...")
-    evaldataset = make_testdataset(mypara, ngroup=100)
-    print(evaldataset.selectregion())
-    
-    # 創建訓練器並開始訓練
-    trainer = GeoVMRNNMixedActivationTrainer(mypara, activation_config=activation_config)
-    trainer.train_model(
-        dataset_train=traindataset,
-        dataset_eval=evaldataset,
-    )
-    
-    print(f"\n{config_name} 混合激活函數配置模型訓練完成！")
-
-
-if __name__ == "__main__":
-    # 獲取示例配置
-    configs_to_train = get_ablation_configs()
-    
-    for config_name in configs_to_train:
-        try:
-            train_with_mixed_activation(config_name)
-        except Exception as e:
-            print(f"訓練 {config_name} 混合激活函數配置模型時出錯: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
-    
-    print("\n所有混合激活函數配置模型訓練完成!")
+# 工廠函數
+def create_supervised_geo_vmrnn(mypara, activation_config=None):
+    """創建支持監督式學習的 GeoVMRNN 模型"""
+    return GeoVMRNN_Supervised(mypara, activation_config=activation_config)
